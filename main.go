@@ -26,18 +26,31 @@ import (
 
 var sniMap sync.Map
 
-type backend struct{}
+// Dependency injection types
+type lookupAType func(ctx context.Context, host string) (net.IP, error)
+type smtpDialStartTLSType func(addr string, tlsConfig *tls.Config) (*smtp.Client, error)
+
+type backend struct {
+	lookupA          lookupAType
+	smtpDialStartTLS smtpDialStartTLSType
+}
 
 func (b *backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	addr := c.Conn().RemoteAddr().String()
-	session := &session{addr: addr}
+	session := &session{
+		addr:             addr,
+		lookupA:          b.lookupA,
+		smtpDialStartTLS: b.smtpDialStartTLS,
+	}
 	session.logf("NewSession")
 	return session, nil
 }
 
 type session struct {
-	addr   string
-	client *smtp.Client
+	addr             string
+	client           *smtp.Client
+	lookupA          lookupAType
+	smtpDialStartTLS smtpDialStartTLSType
 }
 
 func (s *session) connect() error {
@@ -54,13 +67,13 @@ func (s *session) connect() error {
 		return errors.New("SNI required")
 	}
 
-	ip, err := lookupA(context.Background(), sni)
+	ip, err := s.lookupA(context.Background(), sni)
 	if err != nil {
 		return err
 	}
 
 	s.logf("Connecting to real server: %s (%s)", sni, ip.String())
-	client, err := smtp.DialStartTLS(ip.String()+":587", &tls.Config{ServerName: sni})
+	client, err := s.smtpDialStartTLS(ip.String()+":587", &tls.Config{ServerName: sni})
 	if err != nil {
 		return err
 	}
@@ -271,7 +284,10 @@ func generateTLSConfig() *tls.Config {
 }
 
 func main() {
-	b := &backend{}
+	b := &backend{
+		lookupA:          lookupA,
+		smtpDialStartTLS: smtp.DialStartTLS,
+	}
 	s := smtp.NewServer(b)
 
 	s.Addr = ":587"

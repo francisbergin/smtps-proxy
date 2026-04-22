@@ -288,15 +288,34 @@ func main() {
 		lookupA:          lookupA,
 		smtpDialStartTLS: smtp.DialStartTLS,
 	}
-	s := smtp.NewServer(b)
 
-	s.Addr = ":587"
-	s.Domain = "localhost"
-	s.AllowInsecureAuth = false
-	s.TLSConfig = generateTLSConfig()
+	implicitTLSServer := smtp.NewServer(b)
+	implicitTLSServer.Addr = ":465"
+	implicitTLSServer.Domain = "localhost"
+	implicitTLSServer.AllowInsecureAuth = false
 
-	log.Println("Starting SMTP server with STARTTLS on", s.Addr)
-	if err := s.ListenAndServe(); err != nil {
-		log.Fatal(err)
-	}
+	startTLSServer := smtp.NewServer(b)
+	startTLSServer.Addr = ":587"
+	startTLSServer.Domain = "localhost"
+	startTLSServer.AllowInsecureAuth = false
+	startTLSServer.TLSConfig = generateTLSConfig()
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		log.Println("Starting SMTP server with implicit TLS on", implicitTLSServer.Addr)
+		listener, err := tls.Listen("tcp", implicitTLSServer.Addr, generateTLSConfig())
+		if err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- implicitTLSServer.Serve(listener)
+	}()
+
+	go func() {
+		log.Println("Starting SMTP server with STARTTLS on", startTLSServer.Addr)
+		errCh <- startTLSServer.ListenAndServe()
+	}()
+
+	log.Fatal(<-errCh)
 }

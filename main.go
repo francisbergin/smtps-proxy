@@ -7,13 +7,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -157,68 +158,54 @@ func lookupA(ctx context.Context, host string) (net.IP, error) {
 	if !strings.HasSuffix(name, ".") {
 		name += "."
 	}
-
 	qname, err := dnsmessage.NewName(name)
 	if err != nil {
 		return nil, err
 	}
-
-	var idBytes [2]byte
-	if _, err := rand.Read(idBytes[:]); err != nil {
-		return nil, err
-	}
 	msg := dnsmessage.Message{
-		Header: dnsmessage.Header{
-			ID:               binary.BigEndian.Uint16(idBytes[:]),
-			RecursionDesired: true,
-		},
+		Header: dnsmessage.Header{RecursionDesired: true},
 		Questions: []dnsmessage.Question{{
 			Name:  qname,
 			Type:  dnsmessage.TypeA,
 			Class: dnsmessage.ClassINET,
 		}},
 	}
-
 	packet, err := msg.Pack()
 	if err != nil {
 		return nil, err
 	}
 
-	dialer := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, "udp", "8.8.8.8:53")
+	url := "https://9.9.9.9/dns-query?dns=" + base64.RawURLEncoding.EncodeToString(packet)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	req.Header.Set("Accept", "application/dns-message")
 
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	httpResp, err := http.DefaultClient.Do(req)
+	if err != nil {
 		return nil, err
 	}
+	defer httpResp.Body.Close()
 
-	if _, err := conn.Write(packet); err != nil {
-		return nil, err
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("doh query failed: %s", httpResp.Status)
 	}
 
-	respBuf := make([]byte, 512)
-	n, err := conn.Read(respBuf)
+	respBuf, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	var resp dnsmessage.Message
-	if err := resp.Unpack(respBuf[:n]); err != nil {
+	if err := resp.Unpack(respBuf); err != nil {
 		return nil, err
 	}
-
 	for _, answer := range resp.Answers {
-		if answer.Header.Type != dnsmessage.TypeA {
-			continue
-		}
 		if a, ok := answer.Body.(*dnsmessage.AResource); ok {
 			return net.IP(a.A[:]), nil
 		}
 	}
-
 	return nil, errors.New("no A records found")
 }
 

@@ -260,12 +260,45 @@ func TestSessionMethodsReturnConnectError(t *testing.T) {
 
 	if err := s.Mail("from@example.com", nil); err == nil {
 		t.Fatal("expected Mail to fail when connect fails")
+	} else {
+		var smtpErr *smtp.SMTPError
+		if !errors.As(err, &smtpErr) {
+			t.Fatalf("expected SMTPError, got: %T", err)
+		}
+		if smtpErr.Code != 451 {
+			t.Fatalf("expected SMTP 451, got: %d", smtpErr.Code)
+		}
+		if strings.Contains(strings.ToLower(smtpErr.Message), "sni") {
+			t.Fatalf("client-facing error leaked internal detail: %q", smtpErr.Message)
+		}
 	}
 	if err := s.Rcpt("to@example.com", nil); err == nil {
 		t.Fatal("expected Rcpt to fail when connect fails")
+	} else {
+		var smtpErr *smtp.SMTPError
+		if !errors.As(err, &smtpErr) {
+			t.Fatalf("expected SMTPError, got: %T", err)
+		}
+		if smtpErr.Code != 451 {
+			t.Fatalf("expected SMTP 451, got: %d", smtpErr.Code)
+		}
+		if strings.Contains(strings.ToLower(smtpErr.Message), "sni") {
+			t.Fatalf("client-facing error leaked internal detail: %q", smtpErr.Message)
+		}
 	}
 	if err := s.Data(strings.NewReader("body")); err == nil {
 		t.Fatal("expected Data to fail when connect fails")
+	} else {
+		var smtpErr *smtp.SMTPError
+		if !errors.As(err, &smtpErr) {
+			t.Fatalf("expected SMTPError, got: %T", err)
+		}
+		if smtpErr.Code != 451 {
+			t.Fatalf("expected SMTP 451, got: %d", smtpErr.Code)
+		}
+		if strings.Contains(strings.ToLower(smtpErr.Message), "sni") {
+			t.Fatalf("client-facing error leaked internal detail: %q", smtpErr.Message)
+		}
 	}
 }
 

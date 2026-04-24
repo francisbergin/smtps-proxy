@@ -54,6 +54,15 @@ type session struct {
 	smtpDialStartTLS smtpDialStartTLSType
 }
 
+func (s *session) logAndSanitizeError(err error, code int, enhanced smtp.EnhancedCode, message string) error {
+	s.logf("Internal error: %v", err)
+	return &smtp.SMTPError{
+		Code:         code,
+		EnhancedCode: enhanced,
+		Message:      message,
+	}
+}
+
 func (s *session) connect() error {
 	if s.client != nil {
 		return nil
@@ -95,44 +104,53 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 	return sasl.NewPlainServer(func(identity, username, password string) error {
 		s.logf("Auth credentials: identity=%s username=%s password=%s", identity, username, password)
 		if err := s.connect(); err != nil {
-			return err
+			return s.logAndSanitizeError(err, 454, smtp.EnhancedCode{4, 7, 0}, "Temporary authentication failure")
 		}
 		saslClient := sasl.NewPlainClient(identity, username, password)
-		return s.client.Auth(saslClient)
+		if err := s.client.Auth(saslClient); err != nil {
+			return s.logAndSanitizeError(err, 454, smtp.EnhancedCode{4, 7, 0}, "Temporary authentication failure")
+		}
+		return nil
 	}), nil
 }
 
 func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	if err := s.connect(); err != nil {
-		return err
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
 	}
 	s.logf("Mail from: %s", from)
-	return s.client.Mail(from, opts)
+	if err := s.client.Mail(from, opts); err != nil {
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
+	}
+	return nil
 }
 
 func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	if err := s.connect(); err != nil {
-		return err
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
 	}
 	s.logf("Rcpt to: %s", to)
-	return s.client.Rcpt(to, opts)
+	if err := s.client.Rcpt(to, opts); err != nil {
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
+	}
+	return nil
 }
 
 func (s *session) Data(r io.Reader) error {
 	if err := s.connect(); err != nil {
-		return err
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
 	}
 	s.logf("Data received")
 	w, err := s.client.Data()
 	if err != nil {
-		return err
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
 	}
 	n, err := io.Copy(w, r)
 	if err != nil {
-		return err
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
 	}
 	if err = w.Close(); err != nil {
-		return err
+		return s.logAndSanitizeError(err, 451, smtp.EnhancedCode{4, 3, 0}, "Temporary server failure")
 	}
 	s.logf("Data forwarded to real server (%d bytes)", n)
 	return nil

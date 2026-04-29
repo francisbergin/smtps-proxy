@@ -7,10 +7,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -140,8 +143,13 @@ func TestSMTPProxy_EndToEnd(t *testing.T) {
 	proxyServer.Addr = "127.0.0.1:2587"
 	proxyServer.Domain = "127.0.0.1"
 	proxyServer.AllowInsecureAuth = true
+	caDir := t.TempDir()
+	ca, err := loadOrCreateRootCA(filepath.Join(caDir, "root-ca.pem"), filepath.Join(caDir, "root-ca-key.pem"))
+	if err != nil {
+		t.Fatalf("failed to create root CA: %v", err)
+	}
 	// Use generateTLSConfig() to properly handle SNI and store it
-	proxyServer.TLSConfig = generateTLSConfig()
+	proxyServer.TLSConfig = generateTLSConfig(ca)
 
 	go func() {
 		if err := proxyServer.ListenAndServe(); err != nil {
@@ -316,7 +324,11 @@ func TestLookupAInvalidHost(t *testing.T) {
 }
 
 func TestGenerateTLSConfigEmptySNI(t *testing.T) {
-	tlsConfig := generateTLSConfig()
+	ca, err := loadOrCreateRootCA(filepath.Join(t.TempDir(), "root-ca.pem"), filepath.Join(t.TempDir(), "root-ca-key.pem"))
+	if err != nil {
+		t.Fatalf("failed to create root CA: %v", err)
+	}
+	tlsConfig := generateTLSConfig(ca)
 	if tlsConfig.GetConfigForClient == nil {
 		t.Fatal("expected GetConfigForClient to be set")
 	}
@@ -325,11 +337,55 @@ func TestGenerateTLSConfigEmptySNI(t *testing.T) {
 	defer server.Close()
 	defer client.Close()
 
-	_, err := tlsConfig.GetConfigForClient(&tls.ClientHelloInfo{
+	_, err = tlsConfig.GetConfigForClient(&tls.ClientHelloInfo{
 		Conn:       server,
 		ServerName: "",
 	})
 	if err == nil {
 		t.Fatal("expected empty SNI error")
+	}
+}
+
+func TestLoadOrCreateRootCAReusesExistingFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	certPath := filepath.Join(tempDir, "root-ca.pem")
+	keyPath := filepath.Join(tempDir, "root-ca-key.pem")
+
+	createdCA, err := loadOrCreateRootCA(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("failed to create root CA: %v", err)
+	}
+	if createdCA == nil || createdCA.cert == nil {
+		t.Fatal("expected created CA to be populated")
+	}
+
+	reloadedCA, err := loadOrCreateRootCA(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("failed to reload root CA: %v", err)
+	}
+	if reloadedCA == nil || reloadedCA.cert == nil {
+		t.Fatal("expected reloaded CA to be populated")
+	}
+
+	if createdCA.cert.SerialNumber.Cmp(reloadedCA.cert.SerialNumber) != 0 {
+		t.Fatalf("expected same CA serial number, got %s and %s", createdCA.cert.SerialNumber, reloadedCA.cert.SerialNumber)
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("failed reading cert file: %v", err)
+	}
+	certBlock, _ := pem.Decode(certPEM)
+	if certBlock == nil || certBlock.Type != "CERTIFICATE" {
+		t.Fatalf("expected PEM certificate block in %s", certPath)
+	}
+
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("failed reading key file: %v", err)
+	}
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil || keyBlock.Type != "PRIVATE KEY" {
+		t.Fatalf("expected PEM private key block in %s", keyPath)
 	}
 }

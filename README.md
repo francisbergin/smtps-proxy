@@ -2,12 +2,20 @@
 
 A simple SMTP proxy service written in Go. It accepts SMTP connections on both SMTPS/implicit TLS (port 465) and STARTTLS (port 587). This was built as a proof of concept to capture credentials from clients that do not properly validate the returned TLS certificate, while forwarding mail traffic to the proper mail server.
 
+On first startup, the proxy creates a local root CA in the current directory:
+
+- `root-ca.pem` (public CA certificate)
+- `root-ca-key.pem` (private key)
+
+If both files already exist, they are reused so clients that trust `root-ca.pem` continue to trust certificates issued by later runs.
+
 ## Example usage
 
 ```shell
 $ go install github.com/francisbergin/smtps-proxy
 
 $ smtps-proxy
+2026/04/05 16:08:09 Using root CA from root-ca.pem (private key in root-ca-key.pem)
 2026/04/05 16:08:09 Starting SMTP server with STARTTLS on :587
 2026/04/05 16:08:09 Starting SMTP server with implicit TLS on :465
 2026/04/05 16:08:13 127.0.0.1:52208: NewSession

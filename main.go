@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +29,16 @@ import (
 )
 
 var sniMap sync.Map
+
+const (
+	rootCACertFile = "root-ca.pem"
+	rootCAKeyFile  = "root-ca-key.pem"
+)
+
+type certificateAuthority struct {
+	cert       *x509.Certificate
+	privateKey crypto.PrivateKey
+}
 
 // Dependency injection types
 type lookupAType func(ctx context.Context, host string) (net.IP, error)
@@ -235,7 +248,114 @@ func stripHostPort(addr string) string {
 	return h
 }
 
-func generateTLSConfig() *tls.Config {
+func randomSerialNumber() (*big.Int, error) {
+	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+}
+
+func loadOrCreateRootCA(certPath, keyPath string) (*certificateAuthority, error) {
+	certPEM, certErr := os.ReadFile(certPath)
+	keyPEM, keyErr := os.ReadFile(keyPath)
+
+	if certErr == nil && keyErr == nil {
+		certBlock, _ := pem.Decode(certPEM)
+		if certBlock == nil || certBlock.Type != "CERTIFICATE" {
+			return nil, fmt.Errorf("invalid CA certificate in %s", certPath)
+		}
+		cert, err := x509.ParseCertificate(certBlock.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
+		}
+		if !cert.IsCA {
+			return nil, fmt.Errorf("certificate in %s is not a CA", certPath)
+		}
+
+		keyBlock, _ := pem.Decode(keyPEM)
+		if keyBlock == nil {
+			return nil, fmt.Errorf("invalid CA private key in %s", keyPath)
+		}
+		privateKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse CA private key: %w", err)
+		}
+
+		return &certificateAuthority{cert: cert, privateKey: privateKey}, nil
+	}
+
+	if certErr == nil || keyErr == nil {
+		return nil, errors.New("found only one CA file; need both root-ca.pem and root-ca-key.pem")
+	}
+	if !os.IsNotExist(certErr) && certErr != nil {
+		return nil, certErr
+	}
+	if !os.IsNotExist(keyErr) && keyErr != nil {
+		return nil, keyErr
+	}
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate CA private key: %w", err)
+	}
+
+	serialNumber, err := randomSerialNumber()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate CA serial number: %w", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: "smtps-proxy root CA",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CA certificate: %w", err)
+	}
+
+	certOut, err := os.OpenFile(certPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CA certificate file: %w", err)
+	}
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
+		certOut.Close()
+		return nil, fmt.Errorf("failed to write CA certificate: %w", err)
+	}
+	if err := certOut.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close CA certificate file: %w", err)
+	}
+
+	pkcs8Key, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal CA private key: %w", err)
+	}
+	keyOut, err := os.OpenFile(keyPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CA key file: %w", err)
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8Key}); err != nil {
+		keyOut.Close()
+		return nil, fmt.Errorf("failed to write CA private key: %w", err)
+	}
+	if err := keyOut.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close CA key file: %w", err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse generated CA certificate: %w", err)
+	}
+
+	return &certificateAuthority{cert: cert, privateKey: privateKey}, nil
+}
+
+func generateTLSConfig(ca *certificateAuthority) *tls.Config {
 	return &tls.Config{
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			addr := chi.Conn.RemoteAddr().String()
@@ -249,35 +369,36 @@ func generateTLSConfig() *tls.Config {
 			// Store SNI for later use in session
 			sniMap.Store(chi.Conn.RemoteAddr().String(), sni)
 
-			// Generate private key
+			// Generate leaf keypair and sign with the persistent local root CA.
 			priv, err := rsa.GenerateKey(rand.Reader, 2048)
 			if err != nil {
 				return nil, err
 			}
 
-			// Generate certificate template
-			serialNumber, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
+			serialNumber, err := randomSerialNumber()
+			if err != nil {
+				return nil, err
+			}
 			template := x509.Certificate{
 				SerialNumber: serialNumber,
 				Subject: pkix.Name{
 					CommonName: sni,
 				},
 				NotBefore:             time.Now().Add(-24 * time.Hour),
-				NotAfter:              time.Now().Add(24 * time.Hour),
+				NotAfter:              time.Now().AddDate(0, 3, 0),
 				KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 				ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 				BasicConstraintsValid: true,
 				DNSNames:              []string{sni}, // Include SNI in SAN
 			}
 
-			// Create self-signed certificate
-			certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+			certDER, err := x509.CreateCertificate(rand.Reader, &template, ca.cert, &priv.PublicKey, ca.privateKey)
 			if err != nil {
 				return nil, err
 			}
 
 			cert := tls.Certificate{
-				Certificate: [][]byte{certDER},
+				Certificate: [][]byte{certDER, ca.cert.Raw},
 				PrivateKey:  priv,
 			}
 
@@ -289,6 +410,12 @@ func generateTLSConfig() *tls.Config {
 }
 
 func main() {
+	ca, err := loadOrCreateRootCA(rootCACertFile, rootCAKeyFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Using root CA from %s (private key in %s)", rootCACertFile, rootCAKeyFile)
+
 	b := &backend{
 		lookupA:          lookupA,
 		smtpDialStartTLS: smtp.DialStartTLS,
@@ -303,13 +430,13 @@ func main() {
 	startTLSServer.Addr = ":587"
 	startTLSServer.Domain = "localhost"
 	startTLSServer.AllowInsecureAuth = false
-	startTLSServer.TLSConfig = generateTLSConfig()
+	startTLSServer.TLSConfig = generateTLSConfig(ca)
 
 	errCh := make(chan error, 2)
 
 	go func() {
 		log.Println("Starting SMTP server with implicit TLS on", implicitTLSServer.Addr)
-		listener, err := tls.Listen("tcp", implicitTLSServer.Addr, generateTLSConfig())
+		listener, err := tls.Listen("tcp", implicitTLSServer.Addr, generateTLSConfig(ca))
 		if err != nil {
 			errCh <- err
 			return
